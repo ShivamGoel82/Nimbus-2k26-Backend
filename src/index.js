@@ -188,25 +188,51 @@ app.listen(PORT, () => {
     let heartbeatPaused = false;
     global.gameHeartbeat = setInterval(async () => {
       if (heartbeatPaused) return;
+
+      // 1. Resolve phase expiration
       try {
         await resolveExpiredRooms();
-        await runBotActions();
       } catch (e) {
         const isConnErr =
           e.message?.includes("Connection terminated") ||
           e.message?.includes("ECONNRESET") ||
           e.message?.includes("connection") ||
-          e.code === "57P01"; // admin_shutdown
+          e.code === "57P01";
         if (isConnErr) {
           console.warn("[heartbeat] DB connection lost — pausing 2s to reconnect:", e.message);
           heartbeatPaused = true;
           setTimeout(() => { heartbeatPaused = false; }, 2000);
         } else {
-          console.error("[heartbeat] Error resolving expired rooms:", e);
+          console.error("[heartbeat] Error resolving expired rooms:", e.message);
         }
+      }
+
+      // 2. Drive bot actions & AI discussions independently
+      try {
+        await runBotActions();
+      } catch (e) {
+        console.error("[heartbeat] Error running bot actions:", e.message);
       }
     }, 1000);
     console.log("[heartbeat] Game loop started (1s interval)");
+  }
+});
+
+app.get("/api/version", async (_req, res) => {
+  try {
+    const prisma = (await import("./config/prisma.js")).default;
+    const activeRooms = await prisma.gameRoom.findMany({
+      where: { status: { not: "ENDED" } },
+      select: { room_code: true, status: true, round: true, phase_ends_at: true },
+    });
+    return res.json({
+      status: "ok",
+      version: "2026.09.28.v3-bot-chat",
+      uptime: process.uptime(),
+      activeRooms,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
   }
 });
 
