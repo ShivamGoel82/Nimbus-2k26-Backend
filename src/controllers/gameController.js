@@ -825,11 +825,11 @@ export const handleChat = async (req, res) => {
     let targetChannel = `game-${room_code}`;
 
     if (channel === "mafia") {
-      // Only during NIGHT, only for MAFIA (and met HITMAN)
-      if (room.status !== "NIGHT") {
+      // Available during NIGHT and DISCUSSION
+      if (room.status !== "NIGHT" && room.status !== "DISCUSSION") {
         return res
           .status(409)
-          .json({ error: "Mafia chat is only available during NIGHT" });
+          .json({ error: "Mafia chat is only available during NIGHT and DISCUSSION" });
       }
       const meta = room.state_meta
         ? typeof room.state_meta === "string"

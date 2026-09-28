@@ -137,6 +137,30 @@ async function actBotsNight(roomCode, round, aliveBots, alivePlayers, meta) {
   const aliveNonBotIds = alivePlayers.filter((p) => !p.isBot).map((p) => p.id);
   const allAliveIds = alivePlayers.map((p) => p.id);
 
+  // If there are alive mafia bots, post an initial team chat message in private-mafia channel
+  const mafiaBots = aliveBots.filter((b) => b.role === "MAFIA" || b.role === "MAFIA_HELPER" || b.role === "HITMAN");
+  if (mafiaBots.length > 0) {
+    const mafiaBot = pickRandom(mafiaBots);
+    const nonMafia = alivePlayers.filter((p) => p.role !== "MAFIA" && p.role !== "MAFIA_HELPER" && p.role !== "HITMAN");
+    const target = pickRandom(nonMafia);
+    const targetName = target ? target.user?.full_name : "our target";
+
+    setTimeout(async () => {
+      try {
+        const { default: pusher } = await import("../../config/pusher.js");
+        await pusher.trigger(`private-mafia-${roomCode}`, "chat-message", {
+          userId: mafiaBot.user_id,
+          name: mafiaBot.user?.full_name || "Mafia Bot",
+          message: `Partner, I'm thinking we eliminate ${targetName} tonight. What's your call?`,
+          channel: "mafia",
+          timestamp: new Date().toISOString(),
+        });
+      } catch (e) {
+        console.error("[mafia night start chat]", e.message);
+      }
+    }, 1500);
+  }
+
   for (const bot of aliveBots) {
     try {
       await actBotNightRole(bot, roomCode, round, alivePlayers, allAliveIds, aliveNonBotIds, meta);
@@ -576,7 +600,7 @@ function generateBotReply(message, botRole, senderName, otherPlayerNames = []) {
 }
 
 export async function triggerBotChatReply(roomCode, channel, message, senderName) {
-  if (channel && channel !== "global") return;
+  if (channel && channel !== "global" && channel !== "mafia") return;
 
   const alivePlayers = await prisma.gamePlayer.findMany({
     where: { room_code: roomCode, status: "ALIVE" },
@@ -589,6 +613,58 @@ export async function triggerBotChatReply(roomCode, channel, message, senderName
     },
   });
 
+  // ─── MAFIA TEAM CHAT REPLY ───
+  if (channel === "mafia") {
+    const aliveMafiaBots = alivePlayers.filter(
+      (p) => p.isBot && (p.role === "MAFIA" || p.role === "MAFIA_HELPER" || p.role === "HITMAN")
+    );
+    if (aliveMafiaBots.length === 0) return;
+
+    const bot = pickRandom(aliveMafiaBots);
+    const nonMafiaTargets = alivePlayers
+      .filter((p) => p.role !== "MAFIA" && p.role !== "MAFIA_HELPER" && p.role !== "HITMAN")
+      .map((p) => p.user?.full_name || "someone");
+    const targetName = nonMafiaTargets.length > 0 ? pickRandom(nonMafiaTargets) : "someone";
+
+    const msg = message.toLowerCase();
+    let reply;
+    if (msg.includes("who") || msg.includes("kill") || msg.includes("target") || msg.includes("shoot") || msg.includes("vote")) {
+      const replies = [
+        `Let's eliminate ${targetName} tonight!`,
+        `I vote for ${targetName}. They are a big threat to us.`,
+        `Target ${targetName}. Town won't see it coming.`,
+        `We should take down ${targetName} first.`,
+      ];
+      reply = pickRandom(replies);
+    } else {
+      const replies = [
+        `Got it partner! Let's eliminate the citizens together.`,
+        `Agreed. Stay quiet during discussion so they don't suspect us.`,
+        `We have the upper hand. Let's finish them off!`,
+        `I'm with you on this plan.`,
+      ];
+      reply = pickRandom(replies);
+    }
+
+    const delay = 800 + Math.random() * 800;
+    setTimeout(async () => {
+      try {
+        const { default: pusher } = await import("../../config/pusher.js");
+        await pusher.trigger(`private-mafia-${roomCode}`, "chat-message", {
+          userId: bot.user_id,
+          name: bot.user.full_name,
+          message: reply,
+          channel: "mafia",
+          timestamp: new Date().toISOString(),
+        });
+      } catch (e) {
+        console.error("[mafia bot chat]", e.message);
+      }
+    }, delay);
+    return;
+  }
+
+  // ─── GLOBAL CHAT REPLY ───
   const aliveBots = alivePlayers.filter((p) => p.isBot);
   if (aliveBots.length === 0) return;
 
