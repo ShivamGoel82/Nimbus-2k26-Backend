@@ -15,11 +15,15 @@ import pg from "pg";
 const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  max: 3,
-  min: 0,
-  idleTimeoutMillis: 10000,
+  max: 5,
+  min: 1,
+  // Keep idle timeout below Render/Neon's ~5s proxy drop window
+  idleTimeoutMillis: 4000,
   connectionTimeoutMillis: 15000,
-  allowExitOnIdle: true,
+  allowExitOnIdle: false,
+  // TCP keepAlive prevents the proxy from silently killing idle sockets
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 2000,
 });
 
 pool.on('error', (err) => {

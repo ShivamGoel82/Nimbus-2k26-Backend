@@ -184,11 +184,24 @@ app.listen(PORT, () => {
   
   // FIX: Guard prevents multiple intervals on hot reload/restart
   if (!global.gameHeartbeat) {
+    let heartbeatPaused = false;
     global.gameHeartbeat = setInterval(async () => {
+      if (heartbeatPaused) return;
       try {
         await resolveExpiredRooms();
       } catch (e) {
-        console.error("[heartbeat] Error resolving expired rooms:", e);
+        const isConnErr =
+          e.message?.includes("Connection terminated") ||
+          e.message?.includes("ECONNRESET") ||
+          e.message?.includes("connection") ||
+          e.code === "57P01"; // admin_shutdown
+        if (isConnErr) {
+          console.warn("[heartbeat] DB connection lost — pausing 2s to reconnect:", e.message);
+          heartbeatPaused = true;
+          setTimeout(() => { heartbeatPaused = false; }, 2000);
+        } else {
+          console.error("[heartbeat] Error resolving expired rooms:", e);
+        }
       }
     }, 1000);
     console.log("[heartbeat] Game loop started (1s interval)");
