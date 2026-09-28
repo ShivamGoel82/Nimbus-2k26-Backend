@@ -4,7 +4,7 @@ services:
     env: node
     region: singapore  # closest to India — change to oregon/frankfurt if preferred
     plan: free
-    buildCommand: npm install && npx prisma migrate deploy
+    buildCommand: npm install && node scripts/migrate-with-retry.mjs
     startCommand: node src/index.js
     envVars:
       - key: NODE_ENV
