@@ -72,7 +72,14 @@ export async function runBotActions() {
 
   for (const room of activeRooms) {
     const meta = getMeta(room);
-    if (!Array.isArray(meta.bots) || meta.bots.length === 0) continue;
+    let hasBots = Array.isArray(meta.bots) && meta.bots.length > 0;
+    if (!hasBots) {
+      const botCount = await prisma.gamePlayer.count({
+        where: { room_code: room.room_code, isBot: true },
+      });
+      hasBots = botCount > 0;
+    }
+    if (!hasBots) continue;
 
     if (room.status === "NIGHT" || room.status === "VOTING") {
       const key = cacheKey(room.room_code, room.round, room.status);
@@ -267,13 +274,17 @@ async function actBotsDiscussion(room, meta) {
   const discussionStartMs = startTime > 0 ? startTime : new Date(phase_ends_at).getTime() - 120000;
   const elapsedSec = (now - discussionStartMs) / 1000;
 
-  // Don't act in the very first 2 seconds
-  if (elapsedSec < 2) return;
+  // Don't act in the very first 3 seconds (lets morning reveal animation settle)
+  if (elapsedSec < 3) return;
 
   const keyPrefix = `${room_code}:${round}:DISC`;
+  const s1Key = `bot_disc_s1_r${round}`;
+  const s2Key = `bot_disc_s2_r${round}`;
+  const s3Key = `bot_disc_s3_r${round}`;
+  const s4Key = `bot_disc_s4_r${round}`;
 
-  // STEP 1: Accusation / initial lead (around 2.5 - 4s)
-  if (!meta.bot_disc_step1 && !botActedCache.has(`${keyPrefix}:1`)) {
+  // STEP 1: Accusation / initial lead (around 4 - 8s)
+  if (!meta[s1Key] && !botActedCache.has(`${keyPrefix}:1`)) {
     botActedCache.add(`${keyPrefix}:1`);
 
     const speakerBot =
@@ -304,13 +315,14 @@ async function actBotsDiscussion(room, meta) {
       channel: "global",
       timestamp: new Date().toISOString(),
     });
+    console.log(`[bots] 🗣️ Accusation by ${speakerName}: "${message}"`);
 
     await prisma.gameRoom.update({
       where: { room_code },
       data: {
         state_meta: {
           ...meta,
-          bot_disc_step1: true,
+          [s1Key]: true,
           bot_suspect_id: suspect.id,
           bot_suspect_name: suspectName,
           bot_accuser_name: speakerName,
@@ -320,8 +332,8 @@ async function actBotsDiscussion(room, meta) {
     return;
   }
 
-  // STEP 2: Response / Debate (around 5 - 7s)
-  if (meta.bot_disc_step1 && !meta.bot_disc_step2 && elapsedSec >= 5 && !botActedCache.has(`${keyPrefix}:2`)) {
+  // STEP 2: Response / Debate / Mafia Deflection (around 10 - 15s)
+  if (meta[s1Key] && !meta[s2Key] && elapsedSec >= 10 && !botActedCache.has(`${keyPrefix}:2`)) {
     botActedCache.add(`${keyPrefix}:2`);
 
     const suspectName = meta.bot_suspect_name || "the suspect";
@@ -366,22 +378,64 @@ async function actBotsDiscussion(room, meta) {
       channel: "global",
       timestamp: new Date().toISOString(),
     });
+    console.log(`[bots] 🗣️ Debate reply by ${responderName}: "${message}"`);
 
     await prisma.gameRoom.update({
       where: { room_code },
       data: {
         state_meta: {
           ...meta,
-          bot_disc_step2: true,
+          [s2Key]: true,
         },
       },
     });
     return;
   }
 
-  // STEP 3: Consensus & REDUCE TIME (around 8 - 10s)
-  if (meta.bot_disc_step2 && !meta.bot_disc_step3 && elapsedSec >= 8 && !botActedCache.has(`${keyPrefix}:3`)) {
+  // STEP 3: Third Bot chimes in (around 17 - 22s)
+  if (meta[s2Key] && !meta[s3Key] && elapsedSec >= 17 && !botActedCache.has(`${keyPrefix}:3`)) {
     botActedCache.add(`${keyPrefix}:3`);
+
+    const suspectName = meta.bot_suspect_name || "the suspect";
+    const thirdBotCandidates = aliveBots.filter(
+      (b) => b.user?.full_name !== meta.bot_accuser_name
+    );
+    const thirdBot = pickRandom(thirdBotCandidates.length > 0 ? thirdBotCandidates : aliveBots);
+    const thirdName = thirdBot.user?.full_name || "Bot";
+
+    const chimes = [
+      `I've been listening to both sides. ${suspectName} really hasn't cleared their name.`,
+      `We only have so much time. We need to lock in on ${suspectName}!`,
+      `Agreed, let's not split our votes. ${suspectName} is our clearest lead.`,
+      `If we don't eliminate ${suspectName} now, town is in serious danger tonight!`,
+    ];
+    const message = pickRandom(chimes);
+
+    const { default: pusher } = await import("../../config/pusher.js");
+    await pusher.trigger(`game-${room_code}`, "chat-message", {
+      userId: thirdBot.user_id,
+      name: thirdName,
+      message,
+      channel: "global",
+      timestamp: new Date().toISOString(),
+    });
+    console.log(`[bots] 🗣️ Third opinion by ${thirdName}: "${message}"`);
+
+    await prisma.gameRoom.update({
+      where: { room_code },
+      data: {
+        state_meta: {
+          ...meta,
+          [s3Key]: true,
+        },
+      },
+    });
+    return;
+  }
+
+  // STEP 4: Consensus & REDUCE TIME (around 24s)
+  if (meta[s3Key] && !meta[s4Key] && elapsedSec >= 24 && !botActedCache.has(`${keyPrefix}:4`)) {
+    botActedCache.add(`${keyPrefix}:4`);
 
     const suspectName = meta.bot_suspect_name || "our target";
     const suspectId = meta.bot_suspect_id;
@@ -390,9 +444,9 @@ async function actBotsDiscussion(room, meta) {
     const closerName = closerBot.user?.full_name || "Bot";
 
     const conclusions = [
-      `Town has decided: we are voting out ${suspectName}! Speeding up timer ⏩`,
-      `We know what to do in the voting round! Let's eliminate ${suspectName}. Skipping to vote ⏩`,
-      `Decision made on ${suspectName}! Reducing discussion time to vote now ⏩`,
+      `Town consensus reached: we're voting out ${suspectName}! Wrapping up discussion ⏩`,
+      `We all know what to do in the voting round on ${suspectName}! Skipping ahead ⏩`,
+      `Decision made on ${suspectName}! Fast-forwarding to vote now ⏩`,
     ];
     const message = pickRandom(conclusions);
 
@@ -404,9 +458,10 @@ async function actBotsDiscussion(room, meta) {
       channel: "global",
       timestamp: new Date().toISOString(),
     });
+    console.log(`[bots] 🗣️ Consensus closer by ${closerName}: "${message}"`);
 
-    // Reduce discussion time so game moves to VOTING in 3.5 seconds
-    const newEndsAt = new Date(Date.now() + 3500);
+    // Give players 8 seconds from consensus to prepare for voting
+    const newEndsAt = new Date(Date.now() + 8000);
 
     const votes = {};
     for (const bot of aliveBots) {
@@ -419,7 +474,7 @@ async function actBotsDiscussion(room, meta) {
         phase_ends_at: newEndsAt,
         state_meta: {
           ...meta,
-          bot_disc_step3: true,
+          [s4Key]: true,
           bot_target_id: suspectId,
           discussion_time_votes: votes,
         },
@@ -646,17 +701,19 @@ export async function triggerBotChatReply(roomCode, channel, message, senderName
       reply = pickRandom(replies);
     }
 
+    const botName = bot.user?.full_name || "Mafia Bot";
     const delay = 800 + Math.random() * 800;
     setTimeout(async () => {
       try {
         const { default: pusher } = await import("../../config/pusher.js");
         await pusher.trigger(`private-mafia-${roomCode}`, "chat-message", {
           userId: bot.user_id,
-          name: bot.user.full_name,
+          name: botName,
           message: reply,
           channel: "mafia",
           timestamp: new Date().toISOString(),
         });
+        console.log(`[bots] 🕶️ Mafia chat reply by ${botName}: "${reply}"`);
       } catch (e) {
         console.error("[mafia bot chat]", e.message);
       }
@@ -668,11 +725,12 @@ export async function triggerBotChatReply(roomCode, channel, message, senderName
   const aliveBots = alivePlayers.filter((p) => p.isBot);
   if (aliveBots.length === 0) return;
 
-  const isQuestionOrAccusation =
+  const isQuestionOrAccusationOrGreeting =
     QUESTIONS.some((q) => message.includes(q)) ||
-    ACCUSATIONS.some((a) => message.toLowerCase().includes(a));
+    ACCUSATIONS.some((a) => message.toLowerCase().includes(a)) ||
+    GREETINGS.some((g) => message.toLowerCase().includes(g));
 
-  if (!isQuestionOrAccusation && Math.random() > 0.8) return;
+  if (!isQuestionOrAccusationOrGreeting && Math.random() > 0.95) return;
 
   const bot = pickRandom(aliveBots);
   const otherPlayerNames = alivePlayers
@@ -680,6 +738,7 @@ export async function triggerBotChatReply(roomCode, channel, message, senderName
     .map((p) => p.user?.full_name || "someone");
 
   const reply = generateBotReply(message, bot.role, senderName, otherPlayerNames);
+  const botName = bot.user?.full_name || "Bot";
 
   const delay = 1000 + Math.random() * 1000;
 
@@ -688,11 +747,12 @@ export async function triggerBotChatReply(roomCode, channel, message, senderName
       const { default: pusher } = await import("../../config/pusher.js");
       await pusher.trigger(`game-${roomCode}`, "chat-message", {
         userId: bot.user_id,
-        name: bot.user.full_name,
+        name: botName,
         message: reply,
         channel: "global",
         timestamp: new Date().toISOString(),
       });
+      console.log(`[bots] 🤖 Global chat reply by ${botName}: "${reply}"`);
     } catch (e) {
       console.error("[bot chat]", e.message);
     }
