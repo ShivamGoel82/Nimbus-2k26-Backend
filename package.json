@@ -21,7 +21,7 @@
     "test": "node test/api-test.js",
     "test:local": "node test/api-test.js --local",
     "test:mafia": "node test_mafia_game.js",
-    "postinstall": "prisma generate && prisma migrate deploy"
+    "postinstall": "prisma generate"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.0.2",
