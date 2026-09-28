@@ -7,6 +7,7 @@ import CoreTeamRoutes from "./routes/coreTeamRoute.js";
 import GameRoutes from "./routes/gameRoutes.js";
 import errorHandler from "./middlewares/errorMiddleware.js";
 import { resolveExpiredRooms } from "./services/game/resolveService.js";
+import { runBotActions } from "./services/game/botService.js";
 import pusher from "./config/pusher.js";
 import clubRoutes from "./routes/clubsRoute.js";
 import eventRoute from "./routes/eventRoute.js";
@@ -189,6 +190,7 @@ app.listen(PORT, () => {
       if (heartbeatPaused) return;
       try {
         await resolveExpiredRooms();
+        await runBotActions();
       } catch (e) {
         const isConnErr =
           e.message?.includes("Connection terminated") ||
