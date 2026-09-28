@@ -1,25 +1,34 @@
 /**
  * botService.js
  *
- * Automatically submits votes for bot players based on their role + phase.
- * Called from the heartbeat once per phase, shortly after each phase starts.
+ * Automatically submits votes and drives strategic AI discussions for bot players.
+ * Called from the heartbeat once per second.
  *
- * Bot strategy (simple random AI):
+ * Features:
  *   NIGHT phase:
- *     - MAFIA       → MAFIA_TARGET  (random alive non-mafia player)
- *     - DOCTOR      → DOC_SAVE      (random alive player, preferably self)
- *     - NURSE       → NURSE_ACTION  (random alive non-nurse player)
- *     - HITMAN      → HITMAN_TARGET (2 random targets + random role guesses)
- *     - BOUNTY_HUNTER → BOUNTY_HUNTER_SHOT (if VIP dead, random mafia target)
- *     - REPORTER    → skip (ability is rare/strategic, bots skip it)
+ *     - MAFIA / HITMAN → MAFIA_TARGET (alive non-mafia target)
+ *     - DOCTOR         → DOC_SAVE     (alive player, 50% self)
+ *     - NURSE          → NURSE_ACTION (random non-nurse player)
+ *     - HITMAN         → HITMAN_TARGET (2 random targets + role guesses)
+ *     - BOUNTY_HUNTER  → BOUNTY_HUNTER_SHOT (if VIP dead, random mafia target)
+ *
+ *   DISCUSSION phase:
+ *     - Bots discuss suspicions in chat like real players.
+ *     - Citizen bots accuse suspects and build town consensus.
+ *     - Mafia bots act innocent, confuse the town, and deflect blame to citizens without revealing their role.
+ *     - Once town reaches consensus (~8-10s), bots announce the decision and reduce discussion time so game moves to voting fast!
+ *
  *   VOTING phase:
- *     - All alive bots → DAY_LYNCH  (random alive non-self player)
+ *     - Citizen bots vote for the consensus suspect agreed upon during discussion.
+ *     - Mafia bots vote to protect teammates or blend into the crowd.
+ *
+ *   INTERACTIVE CHAT:
+ *     - Bots reply dynamically when real players talk, ask questions, or accuse them in global chat.
  */
 
 import prisma from "../../config/prisma.js";
 
-// Track which (roomCode, round, phase) combos bots have already acted in
-// to avoid submitting duplicate votes across heartbeat ticks.
+// Track which actions bots have already executed to prevent duplicates
 const botActedCache = new Set();
 
 function cacheKey(roomCode, round, phase) {
@@ -34,20 +43,22 @@ function pickRandom(arr) {
 function getMeta(room) {
   if (!room?.state_meta) return {};
   if (typeof room.state_meta === "string") {
-    try { return JSON.parse(room.state_meta); } catch { return {}; }
+    try {
+      return JSON.parse(room.state_meta);
+    } catch {
+      return {};
+    }
   }
   return room.state_meta;
 }
 
 /**
  * Main entry point. Called each heartbeat tick.
- * Only acts once per (room, round, phase) combination.
  */
 export async function runBotActions() {
-  // Only query rooms that have bots (dev_mode rooms)
   const activeRooms = await prisma.gameRoom.findMany({
     where: {
-      status: { in: ["NIGHT", "VOTING"] },
+      status: { in: ["NIGHT", "DISCUSSION", "VOTING"] },
       phase_ends_at: { not: null },
     },
     select: {
@@ -63,24 +74,29 @@ export async function runBotActions() {
     const meta = getMeta(room);
     if (!Array.isArray(meta.bots) || meta.bots.length === 0) continue;
 
-    const key = cacheKey(room.room_code, room.round, room.status);
-    if (botActedCache.has(key)) continue;
+    if (room.status === "NIGHT" || room.status === "VOTING") {
+      const key = cacheKey(room.room_code, room.round, room.status);
+      if (botActedCache.has(key)) continue;
 
-    // Only act after phase has been running for at least 2s (let game state settle)
-    const timeLeftMs = new Date(room.phase_ends_at) - Date.now();
-    const phaseDurationGuess = room.status === "NIGHT" ? 30000 : 10000;
-    const timeElapsedMs = phaseDurationGuess - timeLeftMs;
-    if (timeElapsedMs < 2000) continue;
+      const timeLeftMs = new Date(room.phase_ends_at) - Date.now();
+      const phaseDurationGuess = room.status === "NIGHT" ? 30000 : 10000;
+      const timeElapsedMs = phaseDurationGuess - timeLeftMs;
+      if (timeElapsedMs < 2000) continue;
 
-    // Mark as acted immediately to prevent duplicate submissions
-    botActedCache.add(key);
+      botActedCache.add(key);
 
-    try {
-      await actBotsInRoom(room, meta);
-    } catch (e) {
-      console.error(`[bots] Error acting in room ${room.room_code}:`, e.message);
-      // Remove from cache so it can retry
-      botActedCache.delete(key);
+      try {
+        await actBotsInRoom(room, meta);
+      } catch (e) {
+        console.error(`[bots] Error acting in room ${room.room_code}:`, e.message);
+        botActedCache.delete(key);
+      }
+    } else if (room.status === "DISCUSSION") {
+      try {
+        await actBotsDiscussion(room, meta);
+      } catch (e) {
+        console.error(`[bots] Error in discussion in room ${room.room_code}:`, e.message);
+      }
     }
   }
 
@@ -94,10 +110,15 @@ export async function runBotActions() {
 async function actBotsInRoom(room, meta) {
   const { room_code, round, status } = room;
 
-  // Fetch all alive players in the room
   const alivePlayers = await prisma.gamePlayer.findMany({
     where: { room_code, status: "ALIVE" },
-    select: { id: true, user_id: true, role: true, isBot: true },
+    select: {
+      id: true,
+      user_id: true,
+      role: true,
+      isBot: true,
+      user: { select: { full_name: true } },
+    },
   });
 
   const aliveBots = alivePlayers.filter((p) => p.isBot);
@@ -106,7 +127,7 @@ async function actBotsInRoom(room, meta) {
   if (status === "NIGHT") {
     await actBotsNight(room_code, round, aliveBots, alivePlayers, meta);
   } else if (status === "VOTING") {
-    await actBotsVoting(room_code, round, aliveBots, alivePlayers);
+    await actBotsVoting(room_code, round, aliveBots, alivePlayers, meta);
   }
 }
 
@@ -120,7 +141,6 @@ async function actBotsNight(roomCode, round, aliveBots, alivePlayers, meta) {
     try {
       await actBotNightRole(bot, roomCode, round, alivePlayers, allAliveIds, aliveNonBotIds, meta);
     } catch (e) {
-      // Ignore per-bot errors (e.g. vote already exists), continue others
       if (!e.message?.includes("already")) {
         console.warn(`[bots] Bot ${bot.user_id} (${bot.role}) night action failed:`, e.message);
       }
@@ -134,7 +154,6 @@ async function actBotNightRole(bot, roomCode, round, alivePlayers, allAliveIds, 
   switch (bot.role) {
     case "MAFIA":
     case "MAFIA_HELPER": {
-      // Target a random alive non-mafia player
       const nonMafiaTargets = alivePlayers
         .filter((p) => p.id !== bot.id && p.role !== "MAFIA" && p.role !== "MAFIA_HELPER" && p.role !== "HITMAN")
         .map((p) => p.id);
@@ -145,7 +164,6 @@ async function actBotNightRole(bot, roomCode, round, alivePlayers, allAliveIds, 
     }
 
     case "DOCTOR": {
-      // 50% chance save self, 50% save random other
       const saveSelf = Math.random() < 0.5;
       const target = saveSelf ? bot.id : (pickRandom(othersIds) ?? bot.id);
       await upsertBotVote(roomCode, round, bot.id, target, "DOC_SAVE");
@@ -153,7 +171,6 @@ async function actBotNightRole(bot, roomCode, round, alivePlayers, allAliveIds, 
     }
 
     case "NURSE": {
-      // Pick a random alive non-self player to investigate
       const target = pickRandom(othersIds);
       if (!target) break;
       await upsertBotVote(roomCode, round, bot.id, target, "NURSE_ACTION");
@@ -161,12 +178,10 @@ async function actBotNightRole(bot, roomCode, round, alivePlayers, allAliveIds, 
     }
 
     case "HITMAN": {
-      // Pick 2 random distinct targets and guess random roles for them
       if (othersIds.length < 2) break;
       const shuffled = [...othersIds].sort(() => Math.random() - 0.5);
       const [t1, t2] = shuffled;
 
-      // Look up user_ids for the targets (voteService expects user_ids in target_meta)
       const t1Player = alivePlayers.find((p) => p.id === t1);
       const t2Player = alivePlayers.find((p) => p.id === t2);
       if (!t1Player || !t2Player) break;
@@ -183,7 +198,6 @@ async function actBotNightRole(bot, roomCode, round, alivePlayers, allAliveIds, 
     }
 
     case "BOUNTY_HUNTER": {
-      // If VIP is dead and kill is unlocked, shoot a random mafia player
       if (meta.bounty_kill_unlocked) {
         const mafiaTargets = alivePlayers
           .filter((p) => p.role === "MAFIA" || p.role === "MAFIA_HELPER")
@@ -193,8 +207,6 @@ async function actBotNightRole(bot, roomCode, round, alivePlayers, allAliveIds, 
           await upsertBotVote(roomCode, round, bot.id, target, "BOUNTY_HUNTER_SHOT");
         }
       }
-      // If VIP not set yet and bot is bounty hunter, set a random VIP
-      // (VIP setting is optional for bots, skip for simplicity)
       break;
     }
 
@@ -202,21 +214,245 @@ async function actBotNightRole(bot, roomCode, round, alivePlayers, allAliveIds, 
     case "PROPHET":
     case "CITIZEN":
     default:
-      // These roles have no night action or are passive
       break;
+  }
+}
+
+// ─── DISCUSSION PHASE: STRATEGIC CHAT & TIME REDUCTION ─────────────────────────
+
+async function actBotsDiscussion(room, meta) {
+  const { room_code, round, phase_ends_at } = room;
+
+  const alivePlayers = await prisma.gamePlayer.findMany({
+    where: { room_code, status: "ALIVE" },
+    select: {
+      id: true,
+      user_id: true,
+      role: true,
+      isBot: true,
+      user: { select: { full_name: true } },
+    },
+  });
+
+  const aliveBots = alivePlayers.filter((p) => p.isBot);
+  if (aliveBots.length === 0) return;
+
+  const startRaw = meta.discussion_phase_started_at;
+  const startTime = startRaw ? new Date(startRaw).getTime() : 0;
+  const now = Date.now();
+  const discussionStartMs = startTime > 0 ? startTime : new Date(phase_ends_at).getTime() - 120000;
+  const elapsedSec = (now - discussionStartMs) / 1000;
+
+  // Don't act in the very first 2 seconds
+  if (elapsedSec < 2) return;
+
+  const keyPrefix = `${room_code}:${round}:DISC`;
+
+  // STEP 1: Accusation / initial lead (around 2.5 - 4s)
+  if (!meta.bot_disc_step1 && !botActedCache.has(`${keyPrefix}:1`)) {
+    botActedCache.add(`${keyPrefix}:1`);
+
+    const speakerBot =
+      pickRandom(aliveBots.filter((b) => b.role !== "MAFIA" && b.role !== "HITMAN")) ||
+      pickRandom(aliveBots);
+
+    const possibleSuspects = alivePlayers.filter((p) => p.id !== speakerBot.id);
+    const suspect = pickRandom(possibleSuspects);
+    if (!suspect) return;
+
+    const suspectName = suspect.user?.full_name || "someone";
+    const speakerName = speakerBot.user?.full_name || "Bot";
+
+    const accusations = [
+      `I've been watching ${suspectName}... they're being way too quiet. Anyone else think they're mafia?`,
+      `We need to find the mafia today. What's everyone's read on ${suspectName}?`,
+      `I'm getting really suspicious vibes from ${suspectName}. Look at how they voted earlier!`,
+      `Let's focus on ${suspectName} this round. Their behavior has been off.`,
+      `Town needs to unite. I think ${suspectName} is our best suspect right now.`,
+    ];
+    const message = pickRandom(accusations);
+
+    const { default: pusher } = await import("../../config/pusher.js");
+    await pusher.trigger(`game-${room_code}`, "chat-message", {
+      userId: speakerBot.user_id,
+      name: speakerName,
+      message,
+      channel: "global",
+      timestamp: new Date().toISOString(),
+    });
+
+    await prisma.gameRoom.update({
+      where: { room_code },
+      data: {
+        state_meta: {
+          ...meta,
+          bot_disc_step1: true,
+          bot_suspect_id: suspect.id,
+          bot_suspect_name: suspectName,
+          bot_accuser_name: speakerName,
+        },
+      },
+    });
+    return;
+  }
+
+  // STEP 2: Response / Debate (around 5 - 7s)
+  if (meta.bot_disc_step1 && !meta.bot_disc_step2 && elapsedSec >= 5 && !botActedCache.has(`${keyPrefix}:2`)) {
+    botActedCache.add(`${keyPrefix}:2`);
+
+    const suspectName = meta.bot_suspect_name || "the suspect";
+    const accuserName = meta.bot_accuser_name || "town";
+
+    const otherBots = aliveBots.filter((b) => b.user?.full_name !== accuserName);
+    const responderBot = pickRandom(otherBots.length > 0 ? otherBots : aliveBots);
+    const responderName = responderBot.user?.full_name || "Bot";
+
+    let message;
+    if (responderBot.role === "MAFIA" || responderBot.role === "HITMAN") {
+      // Mafia bot deflects blame to someone else without admitting to being mafia
+      const innocentCandidates = alivePlayers.filter(
+        (p) => p.id !== responderBot.id && p.role !== "MAFIA" && p.role !== "HITMAN" && p.id !== meta.bot_suspect_id
+      );
+      const framedPlayer = pickRandom(innocentCandidates);
+      const framedName = framedPlayer ? framedPlayer.user?.full_name : "someone else";
+
+      const mafiaDeflections = [
+        `Wait, ${suspectName} might actually be innocent! What about ${framedName}? They've been deflecting all game!`,
+        `Don't rush into voting ${suspectName} yet! I think ${framedName} is trying to slip under the radar.`,
+        `Are we sure? Don't let ${accuserName} tunnel vision us. ${framedName} looks much more sus!`,
+        `I'm not convinced about ${suspectName}. The real mafia is probably ${framedName}!`,
+      ];
+      message = pickRandom(mafiaDeflections);
+    } else {
+      // Citizen bot agrees or reinforces suspicion
+      const citizenAgreements = [
+        `I agree with ${accuserName}! ${suspectName} has been super sus. Let's lynch them!`,
+        `Yeah, ${suspectName}'s defense makes no sense. I'm voting them this round.`,
+        `Good eye, ${accuserName}. Let's make sure town votes together on ${suspectName}!`,
+        `I'm ready to vote ${suspectName}. Citizens must stick together!`,
+      ];
+      message = pickRandom(citizenAgreements);
+    }
+
+    const { default: pusher } = await import("../../config/pusher.js");
+    await pusher.trigger(`game-${room_code}`, "chat-message", {
+      userId: responderBot.user_id,
+      name: responderName,
+      message,
+      channel: "global",
+      timestamp: new Date().toISOString(),
+    });
+
+    await prisma.gameRoom.update({
+      where: { room_code },
+      data: {
+        state_meta: {
+          ...meta,
+          bot_disc_step2: true,
+        },
+      },
+    });
+    return;
+  }
+
+  // STEP 3: Consensus & REDUCE TIME (around 8 - 10s)
+  if (meta.bot_disc_step2 && !meta.bot_disc_step3 && elapsedSec >= 8 && !botActedCache.has(`${keyPrefix}:3`)) {
+    botActedCache.add(`${keyPrefix}:3`);
+
+    const suspectName = meta.bot_suspect_name || "our target";
+    const suspectId = meta.bot_suspect_id;
+
+    const closerBot = pickRandom(aliveBots);
+    const closerName = closerBot.user?.full_name || "Bot";
+
+    const conclusions = [
+      `Town has decided: we are voting out ${suspectName}! Speeding up timer ⏩`,
+      `We know what to do in the voting round! Let's eliminate ${suspectName}. Skipping to vote ⏩`,
+      `Decision made on ${suspectName}! Reducing discussion time to vote now ⏩`,
+    ];
+    const message = pickRandom(conclusions);
+
+    const { default: pusher } = await import("../../config/pusher.js");
+    await pusher.trigger(`game-${room_code}`, "chat-message", {
+      userId: closerBot.user_id,
+      name: closerName,
+      message,
+      channel: "global",
+      timestamp: new Date().toISOString(),
+    });
+
+    // Reduce discussion time so game moves to VOTING in 3.5 seconds
+    const newEndsAt = new Date(Date.now() + 3500);
+
+    const votes = {};
+    for (const bot of aliveBots) {
+      votes[bot.user_id] = -1;
+    }
+
+    await prisma.gameRoom.update({
+      where: { room_code },
+      data: {
+        phase_ends_at: newEndsAt,
+        state_meta: {
+          ...meta,
+          bot_disc_step3: true,
+          bot_target_id: suspectId,
+          discussion_time_votes: votes,
+        },
+      },
+    });
+
+    // Broadcast timer change to frontend
+    await pusher.trigger(`game-${room_code}`, "discussion-time-adjusted", {
+      phase: "DISCUSSION",
+      round,
+      phaseEndsAt: newEndsAt.toISOString(),
+      deltaSeconds: 1,
+      netAdjustment: -aliveBots.length,
+      aliveCount: alivePlayers.length,
+      increaseVotes: 0,
+      decreaseVotes: aliveBots.length,
+    });
   }
 }
 
 // ─── VOTING PHASE BOT ACTIONS ─────────────────────────────────────────────────
 
-async function actBotsVoting(roomCode, round, aliveBots, alivePlayers) {
+async function actBotsVoting(roomCode, round, aliveBots, alivePlayers, meta) {
   const allAliveIds = alivePlayers.map((p) => p.id);
+  const targetSuspectId = meta?.bot_target_id;
+  const isTargetAlive = targetSuspectId && alivePlayers.some((p) => p.id === targetSuspectId);
 
   for (const bot of aliveBots) {
     try {
-      // Vote for a random alive player (not self)
-      const targets = allAliveIds.filter((id) => id !== bot.id);
-      const target = pickRandom(targets);
+      let target;
+
+      if (bot.role === "MAFIA" || bot.role === "HITMAN") {
+        // Mafia strategy: if the target is a teammate, vote for an innocent citizen to protect them!
+        const targetPlayer = alivePlayers.find((p) => p.id === targetSuspectId);
+        const isTeammate = targetPlayer && (targetPlayer.role === "MAFIA" || targetPlayer.role === "HITMAN");
+
+        if (isTeammate) {
+          const innocentTargets = alivePlayers
+            .filter((p) => p.id !== bot.id && p.role !== "MAFIA" && p.role !== "HITMAN")
+            .map((p) => p.id);
+          target = pickRandom(innocentTargets.length > 0 ? innocentTargets : allAliveIds.filter((id) => id !== bot.id));
+        } else if (isTargetAlive) {
+          target = targetSuspectId;
+        } else {
+          const nonSelf = allAliveIds.filter((id) => id !== bot.id);
+          target = pickRandom(nonSelf);
+        }
+      } else {
+        // Citizen / Specials vote for consensus target
+        if (isTargetAlive && targetSuspectId !== bot.id) {
+          target = targetSuspectId;
+        } else {
+          const targets = allAliveIds.filter((id) => id !== bot.id);
+          target = pickRandom(targets);
+        }
+      }
+
       if (!target) continue;
       await upsertBotVote(roomCode, round, bot.id, target, "DAY_LYNCH");
     } catch (e) {
@@ -227,7 +463,7 @@ async function actBotsVoting(roomCode, round, aliveBots, alivePlayers) {
   }
 }
 
-// ─── HELPER: direct DB upsert (bypasses submitVote to avoid bot voter checks) ─
+// ─── HELPER: direct DB upsert ─────────────────────────────────────────────────
 
 async function upsertBotVote(roomCode, round, voterId, targetId, voteType, targetMeta = null) {
   const existing = await prisma.gameVote.findFirst({
@@ -256,83 +492,121 @@ async function upsertBotVote(roomCode, round, voterId, targetId, voteType, targe
   console.log(`[bots] 🤖 ${voteType} submitted for voter=${voterId} target=${targetId ?? "meta"} room=${roomCode} round=${round}`);
 }
 
-// ─── BOT AUTO-CHAT SYSTEM ───────────────────────────────────────────────────────
+// ─── DYNAMIC BOT CHAT SYSTEM ───────────────────────────────────────────────────
 
 const GREETINGS = ["hi", "hello", "hey", "sup", "yo"];
-const ACCUSATIONS = ["sus", "mafia", "killer", "vote", "kill", "is bad", "fake"];
+const ACCUSATIONS = ["sus", "mafia", "killer", "vote", "kill", "is bad", "fake", "guilty", "lying", "impostor"];
 const QUESTIONS = ["who", "what", "why", "where", "how", "?"];
 
-function generateBotReply(message, botRole, senderName) {
+function generateBotReply(message, botRole, senderName, otherPlayerNames = []) {
   const msg = message.toLowerCase();
+  const otherName = otherPlayerNames.length > 0 ? pickRandom(otherPlayerNames) : "someone";
+
+  // If asking who is mafia / who to vote
+  if (
+    msg.includes("who") &&
+    (msg.includes("mafia") || msg.includes("vote") || msg.includes("sus") || msg.includes("kill") || msg.includes("lynch"))
+  ) {
+    if (botRole === "MAFIA" || botRole === "HITMAN") {
+      const mafiaReplies = [
+        `I think ${otherName} is definitely mafia. Look at their moves!`,
+        `Don't look at me, I suspect ${otherName}! They've been way too quiet.`,
+        `We should vote out ${otherName} this round. They're trying to deceive town!`,
+      ];
+      return pickRandom(mafiaReplies);
+    } else {
+      const citizenReplies = [
+        `I have a really strong suspicion on ${otherName}. Let's vote them out!`,
+        `Follow the facts: ${otherName} hasn't defended themselves at all.`,
+        `We need to eliminate ${otherName} today to win this for the town!`,
+      ];
+      return pickRandom(citizenReplies);
+    }
+  }
 
   // If accused or voting talk
   if (ACCUSATIONS.some((word) => msg.includes(word))) {
-    const defensive = [
-      "I'm innocent, I swear!",
-      "Why is everyone looking at me?",
-      `I think ${senderName} is the real mafia here.`,
-      "That sounds like something the Mafia would say.",
-      "Don't vote me, I'm just a simple citizen.",
-      "Are we sure about this?",
-    ];
-    return pickRandom(defensive);
+    if (botRole === "MAFIA" || botRole === "HITMAN") {
+      const mafiaDefensive = [
+        `I'm 100% innocent citizen! You're trying to frame me because you're the real mafia!`,
+        `Classic mafia deflection! Don't let ${senderName} trick town!`,
+        `I swear on my role I'm on town's side! Why are you targeting me, ${senderName}?`,
+        `If you vote me, town loses an innocent. Look at ${otherName} instead!`,
+      ];
+      return pickRandom(mafiaDefensive);
+    } else {
+      const citizenDefensive = [
+        "I'm innocent, I swear! Don't waste town's vote on me!",
+        `Why is ${senderName} looking at me? I'm helping the citizens!`,
+        `I think ${senderName} is trying to divert attention from ${otherName}.`,
+        "Don't vote me, I'm a simple citizen trying to win!",
+        "Are we sure about this? You'll regret voting me out.",
+      ];
+      return pickRandom(citizenDefensive);
+    }
   }
 
   if (QUESTIONS.some((word) => msg.includes(word))) {
     const answers = [
-      "I have no idea to be honest.",
-      "Maybe we should wait for more info.",
-      "I was just thinking the same thing.",
-      "Not sure, but we need to be careful.",
-      "Let's focus on finding the mafia.",
+      `Not sure, but we should keep our eyes on ${otherName}.`,
+      "Let's focus on finding the mafia before time runs out.",
+      "I was just analyzing the voting patterns.",
+      "We need to stick together as town to win this.",
     ];
     return pickRandom(answers);
   }
 
   if (GREETINGS.some((word) => msg.includes(word))) {
     const greetings = [
-      `Hey ${senderName}!`,
-      "Hello everyone.",
-      "Hi! Ready to catch some mafia?",
-      "Sup. Let's win this.",
+      `Hey ${senderName}! Ready to catch some mafia?`,
+      "Hello! Let's win this for town.",
+      `Sup ${senderName}. Who are you suspecting?`,
     ];
     return pickRandom(greetings);
   }
 
-  // Fallback generic replies
   const generic = [
     "Yeah, makes sense.",
-    "Interesting...",
-    "I'm keeping an eye on everyone.",
-    "This is getting intense.",
-    "Hmm.",
-    "I agree.",
+    "Interesting point, let's keep that in mind.",
+    "I'm watching everyone closely.",
+    "Let's get ready for the vote.",
+    "I agree with that.",
   ];
   return pickRandom(generic);
 }
 
 export async function triggerBotChatReply(roomCode, channel, message, senderName) {
-  // Only reply to global/discussion chat for simplicity
   if (channel && channel !== "global") return;
 
-  // Fetch alive bots in the room
   const alivePlayers = await prisma.gamePlayer.findMany({
     where: { room_code: roomCode, status: "ALIVE" },
-    select: { id: true, user_id: true, role: true, isBot: true, user: { select: { full_name: true } } },
+    select: {
+      id: true,
+      user_id: true,
+      role: true,
+      isBot: true,
+      user: { select: { full_name: true } },
+    },
   });
 
   const aliveBots = alivePlayers.filter((p) => p.isBot);
   if (aliveBots.length === 0) return;
 
-  // 30% chance to reply so they don't spam every single message
-  if (Math.random() > 0.3) return;
+  const isQuestionOrAccusation =
+    QUESTIONS.some((q) => message.includes(q)) ||
+    ACCUSATIONS.some((a) => message.toLowerCase().includes(a));
+
+  if (!isQuestionOrAccusation && Math.random() > 0.8) return;
 
   const bot = pickRandom(aliveBots);
-  const reply = generateBotReply(message, bot.role, senderName);
+  const otherPlayerNames = alivePlayers
+    .filter((p) => p.id !== bot.id && p.user?.full_name !== senderName)
+    .map((p) => p.user?.full_name || "someone");
 
-  // Random delay between 1.5s to 3s to feel natural
-  const delay = 1500 + Math.random() * 1500;
-  
+  const reply = generateBotReply(message, bot.role, senderName, otherPlayerNames);
+
+  const delay = 1000 + Math.random() * 1000;
+
   setTimeout(async () => {
     try {
       const { default: pusher } = await import("../../config/pusher.js");

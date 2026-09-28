@@ -68,134 +68,71 @@ export async function startGame(
     let bots = [];
     let roomSizeEnum;
 
-    if (devMode) {
-      const actualSize = ROOM_SIZE_TO_COUNT[room.room_size] ?? 5;
-      const botCount = actualSize - realPlayerCount;
+    // Auto-fill with bots in both devMode and normal mode when room isn't full
+    const targetSize = ROOM_SIZE_TO_COUNT[room.room_size] ?? 5;
+    const botCount = targetSize - realPlayerCount;
 
-      if (botCount < 0) {
-        throw Object.assign(
-          new Error("Too many real players for selected room size"),
-          { status: 400 }
-        );
-      }
+    if (botCount < 0) {
+      throw Object.assign(
+        new Error("Too many real players for selected room size"),
+        { status: 400 }
+      );
+    }
 
+    if (botCount > 0) {
       const botNames = [
-        "Bot Aarav",
-        "Bot Riya",
-        "Bot Karan",
-        "Bot Priya",
-        "Bot Arjun",
-        "Bot Neha",
-        "Bot Vikram",
-        "Bot Ananya",
-        "Bot Rohan",
-        "Bot Divya",
-        "Bot Siddharth",
+        "Bot Aarav", "Bot Riya", "Bot Karan", "Bot Priya", "Bot Arjun",
+        "Bot Neha", "Bot Vikram", "Bot Ananya", "Bot Rohan", "Bot Divya",
+        "Bot Siddharth", "Bot Mehta", "Bot Kabir", "Bot Ishaan", "Bot Tanya",
       ];
 
+      const botUsers = [];
+      const botPlayers = [];
       for (let i = 0; i < botCount; i++) {
         const botUserId = randomUUID();
         const botName = botNames[i] ?? `Bot ${i + 1}`;
-
-        await tx.user.upsert({
-          where: { user_id: botUserId },
-          update: {},
-          create: {
-            user_id: botUserId,
-            full_name: botName,
-            email: `${botUserId}@bot.local`,
-          },
+        botUsers.push({
+          user_id: botUserId,
+          full_name: botName,
+          email: `${botUserId}@bot.local`,
         });
-
-        const botPlayer = await tx.gamePlayer.create({
-          data: {
-            room_code: roomCode,
-            user_id: botUserId,
-            isBot: true,
-          },
-          select: { id: true, user_id: true },
-        });
-
-        bots.push({
-          userId: botUserId,
-          id: botPlayer.id,
+        botPlayers.push({
+          room_code: roomCode,
+          user_id: botUserId,
+          isBot: true,
         });
       }
 
-      if (botCount > 0) {
-        const updatedRoom = await tx.gameRoom.findUnique({
-          where: { room_code: roomCode },
-          include: { players: true },
-        });
-        players = updatedRoom?.players ?? players;
-      }
+      await tx.user.createMany({
+        data: botUsers,
+        skipDuplicates: true,
+      });
 
+      await tx.gamePlayer.createMany({
+        data: botPlayers,
+      });
+
+      // Refresh players list to include new bots
+      const updatedRoom = await tx.gameRoom.findUnique({
+        where: { room_code: roomCode },
+        include: { players: true },
+      });
+      players = updatedRoom?.players ?? players;
       roomSizeEnum = room.room_size ?? "FIVE";
-    } else {
-      // Auto-fill with bots if room isn't full yet
-      const targetSize = ROOM_SIZE_TO_COUNT[room.room_size] ?? 5;
-      const botCount = targetSize - realPlayerCount;
 
-      if (botCount < 0) {
+      bots = players
+        .filter((p) => p.isBot)
+        .map((p) => ({ userId: p.user_id, id: p.id }));
+    } else {
+      // Exact player count — validate normally
+      roomSizeEnum = validateRoomSize(realPlayerCount);
+      if (!roomSizeEnum) {
         throw Object.assign(
-          new Error("Too many real players for selected room size"),
+          new Error(`Player count ${realPlayerCount} is invalid. Must be 5, 8, or 12.`),
           { status: 400 }
         );
       }
-
-      if (botCount > 0) {
-        // Not enough real players — fill remaining slots with bots
-        const botNames = [
-          "Bot Aarav", "Bot Riya", "Bot Karan", "Bot Priya", "Bot Arjun",
-          "Bot Neha", "Bot Vikram", "Bot Ananya", "Bot Rohan", "Bot Divya",
-          "Bot Siddharth",
-        ];
-
-        for (let i = 0; i < botCount; i++) {
-          const botUserId = randomUUID();
-          const botName = botNames[i] ?? `Bot ${i + 1}`;
-
-          await tx.user.upsert({
-            where: { user_id: botUserId },
-            update: {},
-            create: {
-              user_id: botUserId,
-              full_name: botName,
-              email: `${botUserId}@bot.local`,
-            },
-          });
-
-          const botPlayer = await tx.gamePlayer.create({
-            data: { room_code: roomCode, user_id: botUserId, isBot: true },
-            select: { id: true, user_id: true },
-          });
-
-          bots.push({ userId: botUserId, id: botPlayer.id });
-        }
-
-        // Refresh players list to include new bots
-        const updatedRoom = await tx.gameRoom.findUnique({
-          where: { room_code: roomCode },
-          include: { players: true },
-        });
-        players = updatedRoom?.players ?? players;
-      }
-
-      roomSizeEnum = room.room_size ?? "FIVE";
-
-      // If room had exactly the right number of real players, validate normally
-      if (botCount === 0) {
-        const validated = validateRoomSize(realPlayerCount);
-        if (!validated) {
-          throw Object.assign(
-            new Error(`Player count ${realPlayerCount} is invalid. Must be 5, 8, or 12.`),
-            { status: 400 }
-          );
-        }
-        roomSizeEnum = validated;
-      }
     }
-
 
     const assignments = buildRoleAssignments(
       players,
@@ -204,12 +141,11 @@ export async function startGame(
       hostUserId
     );
 
-    if (devMode) {
-      bots = bots.map((bot) => ({
-        ...bot,
-        role: assignments[players.find((p) => p.user_id === bot.userId)?.id] || null,
-      }));
-    }
+    // Enrich bots with their assigned role (useful for botService strategy)
+    bots = bots.map((bot) => ({
+      ...bot,
+      role: assignments[players.find((p) => p.user_id === bot.userId)?.id] || null,
+    }));
 
     const phaseEndsAt = new Date(Date.now() + PHASE_DURATION.NIGHT);
     const existingMeta = parseStateMeta(room.state_meta);
@@ -239,12 +175,14 @@ export async function startGame(
       },
     });
 
-    for (const [playerId, role] of Object.entries(assignments)) {
-      await tx.gamePlayer.update({
-        where: { id: playerId },
-        data: { role },
-      });
-    }
+    await Promise.all(
+      Object.entries(assignments).map(([playerId, role]) =>
+        tx.gamePlayer.update({
+          where: { id: playerId },
+          data: { role },
+        })
+      )
+    );
 
     const gamePlayers = await tx.gamePlayer.findMany({
       where: { room_code: roomCode },
@@ -253,7 +191,7 @@ export async function startGame(
 
     return { phaseEndsAt, gamePlayers };
     },
-    { timeout: 20000 }
+    { timeout: 45000 }
   );
 
   // Broadcast game-started to the whole room.

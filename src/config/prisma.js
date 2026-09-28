@@ -5,8 +5,8 @@ const { PrismaClient } = pkg;
 import { PrismaPg } from "@prisma/adapter-pg";
 import pg from "pg";
 
-// Render internal PostgreSQL — same private network, no SSL needed
-const isRenderInternal = (process.env.DATABASE_URL || '').includes('dpg-');
+// Render internal PostgreSQL (no domain) — same private network, no SSL needed. External Render URL (.render.com) requires SSL.
+const isRenderInternal = (process.env.DATABASE_URL || '').includes('dpg-') && !(process.env.DATABASE_URL || '').includes('.render.com');
 const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: isRenderInternal ? false : { rejectUnauthorized: false },
