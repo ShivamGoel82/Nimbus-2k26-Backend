@@ -227,7 +227,7 @@ app.get("/api/version", async (_req, res) => {
     });
     return res.json({
       status: "ok",
-      version: "2026.09.28.v3-bot-chat",
+      version: "2026.09.28.v4-adaptive-bots",
       uptime: process.uptime(),
       activeRooms,
     });
