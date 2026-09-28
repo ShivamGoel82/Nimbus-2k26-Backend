@@ -9,28 +9,19 @@ dotenv.config({ path: join(__dirname, '../../.env') });
 
 import pkg from '@prisma/client';
 const { PrismaClient } = pkg;
-import { PrismaPg } from "@prisma/adapter-pg";
-import pg from "pg";
+import { PrismaNeon } from "@prisma/adapter-neon";
+import { Pool } from "@neondatabase/serverless";
 
-const pool = new pg.Pool({
+// Neon manages connection pooling on their side — no manual pool config needed
+const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  max: 5,
-  min: 1,
-  // Keep idle timeout below Render/Neon's ~5s proxy drop window
-  idleTimeoutMillis: 4000,
-  connectionTimeoutMillis: 15000,
-  allowExitOnIdle: false,
-  // TCP keepAlive prevents the proxy from silently killing idle sockets
-  keepAlive: true,
-  keepAliveInitialDelayMillis: 2000,
 });
 
 pool.on('error', (err) => {
   console.error('Pool error:', err.message);
 });
 
-const adapter = new PrismaPg(pool);
+const adapter = new PrismaNeon(pool);
 
 const prisma = new PrismaClient({
   adapter,
