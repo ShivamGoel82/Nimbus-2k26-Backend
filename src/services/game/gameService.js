@@ -194,13 +194,21 @@ export async function startGame(
     { timeout: 45000 }
   );
 
-  // Broadcast game-started to the whole room.
-  await pusher.trigger(`game-${roomCode}`, "game-started", {
-    phase: "NIGHT",
-    round: 1,
-    phaseEndsAt: phaseEndsAt.toISOString(),
-    devMode,
-  });
+  // Broadcast game-started to the whole room (both game and room channels)
+  await Promise.all([
+    pusher.trigger(`game-${roomCode}`, "game-started", {
+      phase: "NIGHT",
+      round: 1,
+      phaseEndsAt: phaseEndsAt.toISOString(),
+      devMode,
+    }),
+    pusher.trigger(`room-${roomCode}`, "game-started", {
+      phase: "NIGHT",
+      round: 1,
+      phaseEndsAt: phaseEndsAt.toISOString(),
+      devMode,
+    }),
+  ]);
 
   // Tell the global browse rooms channel that this room is no longer in LOBBY.
   await pusher.trigger("rooms", "room-closed", {

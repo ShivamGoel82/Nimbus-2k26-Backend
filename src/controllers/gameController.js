@@ -922,9 +922,21 @@ export const handlePusherAuth = async (req, res) => {
         .json({ error: "socket_id and channel_name are required" });
     }
 
+    // ── Private lobby channel: private-lobby-{roomCode} ────────────────────
+    if (channel.startsWith("private-lobby-")) {
+      const roomCode = channel.replace("private-lobby-", "");
+      const player = await prisma.gamePlayer.findUnique({
+        where: { room_code_user_id: { room_code: roomCode, user_id: userId } },
+      });
+      if (!player) return res.status(403).json({ error: "Not in this room" });
+      const auth = pusher.authorizeChannel(socketId, channel);
+      return res.status(200).json(auth);
+    }
+
     // ── Private user channel: private-{userId} ─────────────────────────────
     if (
       channel.startsWith("private-") &&
+      !channel.startsWith("private-lobby-") &&
       !channel.startsWith("private-mafia-") &&
       !channel.startsWith("private-doc-") &&
       !channel.startsWith("private-hitman-") &&

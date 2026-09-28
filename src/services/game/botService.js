@@ -72,8 +72,8 @@ export async function runBotActions() {
 
   for (const room of activeRooms) {
     const meta = getMeta(room);
-    let hasBots = Array.isArray(meta.bots) && meta.bots.length > 0;
-    if (!hasBots) {
+    let hasBots = Array.isArray(meta.bots) ? meta.bots.length > 0 : null;
+    if (hasBots === null) {
       const botCount = await prisma.gamePlayer.count({
         where: { room_code: room.room_code, isBot: true },
       });
