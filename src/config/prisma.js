@@ -2,19 +2,24 @@ import "dotenv/config";
 
 import pkg from '@prisma/client';
 const { PrismaClient } = pkg;
-import { PrismaNeon } from "@prisma/adapter-neon";
-import { Pool } from "@neondatabase/serverless";
+import { PrismaPg } from "@prisma/adapter-pg";
+import pg from "pg";
 
-// Neon manages connection pooling on their side — no manual pool config needed
-const pool = new Pool({
+// Render internal PostgreSQL — same private network, no SSL needed
+const isRenderInternal = (process.env.DATABASE_URL || '').includes('dpg-');
+const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
+  ssl: isRenderInternal ? false : { rejectUnauthorized: false },
+  max: 5,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
 });
 
 pool.on('error', (err) => {
   console.error('Pool error:', err.message);
 });
 
-const adapter = new PrismaNeon(pool);
+const adapter = new PrismaPg(pool);
 
 const prisma = new PrismaClient({
   adapter,
