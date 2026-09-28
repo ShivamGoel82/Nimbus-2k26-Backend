@@ -61,7 +61,7 @@ export async function runBotActions() {
 
   for (const room of activeRooms) {
     const meta = getMeta(room);
-    if (!meta.dev_mode || !Array.isArray(meta.bots) || meta.bots.length === 0) continue;
+    if (!Array.isArray(meta.bots) || meta.bots.length === 0) continue;
 
     const key = cacheKey(room.room_code, room.round, room.status);
     if (botActedCache.has(key)) continue;
