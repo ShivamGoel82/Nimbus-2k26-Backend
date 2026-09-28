@@ -8,6 +8,7 @@ import {
 import { startGame } from "../services/game/gameService.js";
 import { submitVote } from "../services/game/voteService.js";
 import { PHASE_DURATION } from "../services/game/resolveService.js";
+import { triggerBotChatReply } from "../services/game/botService.js";
 
 // ─── PHASE GUARD MAP ──────────────────────────────────────────────────────────
 // Each vote_type is only valid in certain game phases
@@ -896,6 +897,9 @@ export const handleChat = async (req, res) => {
       channel: channel || "global",
       timestamp: new Date().toISOString(),
     });
+
+    // Fire-and-forget bot reply
+    triggerBotChatReply(room_code, channel, message.trim(), player.user.full_name).catch(e => console.error(e));
 
     return res.status(200).json({ success: true });
   } catch (err) {

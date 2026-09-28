@@ -255,3 +255,96 @@ async function upsertBotVote(roomCode, round, voterId, targetId, voteType, targe
 
   console.log(`[bots] 🤖 ${voteType} submitted for voter=${voterId} target=${targetId ?? "meta"} room=${roomCode} round=${round}`);
 }
+
+// ─── BOT AUTO-CHAT SYSTEM ───────────────────────────────────────────────────────
+
+const GREETINGS = ["hi", "hello", "hey", "sup", "yo"];
+const ACCUSATIONS = ["sus", "mafia", "killer", "vote", "kill", "is bad", "fake"];
+const QUESTIONS = ["who", "what", "why", "where", "how", "?"];
+
+function generateBotReply(message, botRole, senderName) {
+  const msg = message.toLowerCase();
+
+  // If accused or voting talk
+  if (ACCUSATIONS.some((word) => msg.includes(word))) {
+    const defensive = [
+      "I'm innocent, I swear!",
+      "Why is everyone looking at me?",
+      `I think ${senderName} is the real mafia here.`,
+      "That sounds like something the Mafia would say.",
+      "Don't vote me, I'm just a simple citizen.",
+      "Are we sure about this?",
+    ];
+    return pickRandom(defensive);
+  }
+
+  if (QUESTIONS.some((word) => msg.includes(word))) {
+    const answers = [
+      "I have no idea to be honest.",
+      "Maybe we should wait for more info.",
+      "I was just thinking the same thing.",
+      "Not sure, but we need to be careful.",
+      "Let's focus on finding the mafia.",
+    ];
+    return pickRandom(answers);
+  }
+
+  if (GREETINGS.some((word) => msg.includes(word))) {
+    const greetings = [
+      `Hey ${senderName}!`,
+      "Hello everyone.",
+      "Hi! Ready to catch some mafia?",
+      "Sup. Let's win this.",
+    ];
+    return pickRandom(greetings);
+  }
+
+  // Fallback generic replies
+  const generic = [
+    "Yeah, makes sense.",
+    "Interesting...",
+    "I'm keeping an eye on everyone.",
+    "This is getting intense.",
+    "Hmm.",
+    "I agree.",
+  ];
+  return pickRandom(generic);
+}
+
+export async function triggerBotChatReply(roomCode, channel, message, senderName) {
+  // Only reply to global/discussion chat for simplicity
+  if (channel && channel !== "global") return;
+
+  // Fetch alive bots in the room
+  const alivePlayers = await prisma.gamePlayer.findMany({
+    where: { room_code: roomCode, status: "ALIVE" },
+    select: { id: true, user_id: true, role: true, isBot: true, user: { select: { full_name: true } } },
+  });
+
+  const aliveBots = alivePlayers.filter((p) => p.isBot);
+  if (aliveBots.length === 0) return;
+
+  // 30% chance to reply so they don't spam every single message
+  if (Math.random() > 0.3) return;
+
+  const bot = pickRandom(aliveBots);
+  const reply = generateBotReply(message, bot.role, senderName);
+
+  // Random delay between 1.5s to 3s to feel natural
+  const delay = 1500 + Math.random() * 1500;
+  
+  setTimeout(async () => {
+    try {
+      const { default: pusher } = await import("../../config/pusher.js");
+      await pusher.trigger(`game-${roomCode}`, "chat-message", {
+        userId: bot.user_id,
+        name: bot.user.full_name,
+        message: reply,
+        channel: "global",
+        timestamp: new Date().toISOString(),
+      });
+    } catch (e) {
+      console.error("[bot chat]", e.message);
+    }
+  }, delay);
+}
